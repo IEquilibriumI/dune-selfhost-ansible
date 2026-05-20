@@ -181,6 +181,8 @@ If `ansible-playbook` is not on `PATH`:
 ANSIBLE_PLAYBOOK=/path/to/ansible-playbook ./scripts/run_full_setup.sh
 ```
 
+This repo ships an `ansible.cfg` with host key checking disabled so first-time SSH to the Proxmox host and rebuilt Ubuntu guests does not block unattended runs.
+
 ## Prompt Reference
 
 The wrapper prompts for the following values:
@@ -240,8 +242,9 @@ This repo intentionally avoids hardcoding these values.
   - defaults to your detected public IP
   - can be overridden manually at the prompt
 - `HOST_DATACENTER_ID`
-  - is derived from the generated battlegroup ID
-  - remains unique per created world
+  - is derived from the Ubuntu guest hostname
+  - should therefore match the hostname managed in `/etc/hostname` and `/etc/hosts`
+  - if the guest hostname is empty, the repo leaves the vendor default `HOST_DATACENTER_ID` in place and warns instead of failing
 
 ## Validation After Setup
 
@@ -279,6 +282,10 @@ ANSIBLE_PLAYBOOK=/path/to/ansible-playbook ./scripts/run_full_setup.sh
 
 The playbooks already use relaxed host-key handling for the rebuilt guest. If you are manually SSHing and see host key mismatch warnings, remove the old entry from your local `known_hosts`.
 
+### Proxmox connection fails with `Host key verification failed`
+
+The public repo disables Ansible host key checking in `ansible.cfg`, so a fresh clone should not stop on first contact with the Proxmox host. If you still see this, make sure you are running from the repo root so Ansible picks up the bundled config file.
+
 ### The wrapper asks for SSH key paths, but you normally use passwords
 
 That is intentional. This repo provisions a fresh Ubuntu guest and injects an SSH public key through cloud-init. Later playbooks connect to that guest with the matching private key. Password-based SSH to the Dune VM is not implemented in the public workflow.
@@ -307,6 +314,13 @@ Provide either:
 - a local archive path on the controller
 
 If left blank, the repo uses SteamCMD with App ID `4754530`.
+
+### The Ubuntu template already exists
+
+`playbooks/01_build_template.yml` intentionally stops if the chosen template VMID already exists. Reuse is not automatic in the current public flow. Either:
+
+- delete the existing template first
+- choose a different template VMID
 
 ## Manual Playbook Order
 

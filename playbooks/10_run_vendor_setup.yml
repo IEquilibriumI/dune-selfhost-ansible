@@ -193,9 +193,21 @@
       ansible.builtin.debug:
         msg: "Created namespace: {{ dune_namespace.stdout }}"
 
-    - name: Store world-unique host datacenter ID
+    - name: Get guest hostname for host datacenter ID
+      ansible.builtin.command:
+        cmd: hostnamectl --static
+      register: guest_hostname
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if guest hostname is empty
+      ansible.builtin.debug:
+        msg: "Guest hostname is empty; leaving vendor HOST_DATACENTER_ID values unchanged."
+      when: guest_hostname.stdout | trim | length == 0
+
+    - name: Store host datacenter ID from guest hostname
       ansible.builtin.set_fact:
-        world_host_datacenter_id: "{{ dune_namespace.stdout | regex_replace('^funcom-seabass-', '') }}"
+        world_host_datacenter_id: "{{ guest_hostname.stdout | trim }}"
 
     - name: Wait for Battlegroup resource
       ansible.builtin.shell: |
@@ -242,18 +254,19 @@
                     if next_field == "ip":
                         lines[index] = f"{indent}value: {player_ip}{newline}"
                         replaced_ip += 1
-                    else:
+                    elif host_id:
                         lines[index] = f"{indent}value: {host_id}{newline}"
                         replaced_host_id += 1
                 next_field = None
 
         if replaced_ip == 0:
             raise SystemExit("No HOST_DATACENTER_IP_ADDRESS values were found in the generated world manifest")
-        if replaced_host_id == 0:
-            raise SystemExit("No HOST_DATACENTER_ID values were found in the generated world manifest")
 
         open(path, "w", encoding="utf-8").writelines(lines)
-        print(f"Updated {replaced_ip} HOST_DATACENTER_IP_ADDRESS values and {replaced_host_id} HOST_DATACENTER_ID values in {path}")
+        if host_id:
+            print(f"Updated {replaced_ip} HOST_DATACENTER_IP_ADDRESS values and {replaced_host_id} HOST_DATACENTER_ID values in {path}")
+        else:
+            print(f"Updated {replaced_ip} HOST_DATACENTER_IP_ADDRESS values and left HOST_DATACENTER_ID unchanged in {path}")
         PY
       args:
         executable: /bin/bash
@@ -296,7 +309,7 @@
                                 "path": "/" + "/".join(esc(part) for part in path_parts + ["envVars", index, "value"]),
                                 "value": player_ip,
                             })
-                        if isinstance(item, dict) and item.get("name") == "HOST_DATACENTER_ID":
+                        if host_id and isinstance(item, dict) and item.get("name") == "HOST_DATACENTER_ID":
                             ops.append({
                                 "op": "replace" if "value" in item else "add",
                                 "path": "/" + "/".join(esc(part) for part in path_parts + ["envVars", index, "value"]),
