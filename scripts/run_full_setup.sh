@@ -85,8 +85,8 @@ if [[ ! -f "$INVENTORY_PATH" ]]; then
   exit 1
 fi
 
-prompt_default SSH_PRIVATE_KEY_PATH "SSH private key path for the Dune VM" "${DUNE_SSH_PRIVATE_KEY_PATH:-$HOME/.ssh/id_ed25519}"
-prompt_default SSH_PUBLIC_KEY_PATH "SSH public key path for VM creation" "${DUNE_SSH_PUBLIC_KEY_PATH:-$HOME/.ssh/id_ed25519.pub}"
+prompt_default SSH_PRIVATE_KEY_PATH "SSH private key path for the Dune VM (dedicated Dune-specific key recommended)" "${DUNE_SSH_PRIVATE_KEY_PATH:-$HOME/.ssh/id_ed25519}"
+prompt_default SSH_PUBLIC_KEY_PATH "SSH public key path for VM creation (should match the private key above)" "${DUNE_SSH_PUBLIC_KEY_PATH:-$HOME/.ssh/id_ed25519.pub}"
 
 export DUNE_SSH_PRIVATE_KEY_PATH="$SSH_PRIVATE_KEY_PATH"
 export DUNE_SSH_PUBLIC_KEY_PATH="$SSH_PUBLIC_KEY_PATH"

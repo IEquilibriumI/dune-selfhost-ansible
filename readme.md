@@ -113,10 +113,17 @@ Required tools:
 
 You also need an SSH keypair that can be injected into the Dune VM during cloud-init.
 
+Recommended:
+
+- Use a dedicated SSH keypair for this Dune VM instead of your normal personal key
+- Use the same keypair for both cloud-init injection and later SSH access to the guest
+
 Default paths used by the wrapper:
 
 - private key: `~/.ssh/id_ed25519`
 - public key: `~/.ssh/id_ed25519.pub`
+
+If you leave the defaults unchanged, the wrapper will try those standard SSH key paths. That is convenient, but a dedicated Dune-specific keypair is the safer recommendation.
 
 ## Quick Start on WSL Ubuntu
 
@@ -131,6 +138,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install --upgrade pip
 pip install ansible
+ssh-keygen -t ed25519 -f ~/.ssh/dune_vm_ed25519
 ```
 
 If you install Ansible into a local virtualenv instead of system-wide, either activate the venv first or run:
@@ -138,6 +146,11 @@ If you install Ansible into a local virtualenv instead of system-wide, either ac
 ```bash
 ANSIBLE_PLAYBOOK=/path/to/venv/bin/ansible-playbook ./scripts/run_full_setup.sh
 ```
+
+For a dedicated project keypair on this example setup, you would typically use:
+
+- private key: `~/.ssh/dune_vm_ed25519`
+- public key: `~/.ssh/dune_vm_ed25519.pub`
 
 ## Inventory Setup
 
@@ -174,8 +187,8 @@ The wrapper prompts for the following values:
 | Prompt | Meaning |
 |---|---|
 | `Inventory file path` | Inventory containing the Proxmox host |
-| `SSH private key path for the Dune VM` | Private key used to SSH into the Ubuntu guest |
-| `SSH public key path for VM creation` | Public key injected into the guest by cloud-init |
+| `SSH private key path for the Dune VM` | Private key used to SSH into the Ubuntu guest; a dedicated Dune-specific key is recommended |
+| `SSH public key path for VM creation` | Public key injected into the guest by cloud-init; should match the private key above |
 | `Ubuntu cloud-init template VMID` | Proxmox VMID for the Ubuntu template |
 | `Template name` | Template VM name |
 | `New Dune VMID` | Proxmox VMID for the Dune server VM |
