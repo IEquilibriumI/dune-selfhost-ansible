@@ -1,0 +1,55 @@
+---
+- name: Register Dune VM host
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: vm_ip
+      prompt: "Dune VM IP address"
+      private: false
+
+  tasks:
+    - name: Add Dune VM to temporary inventory
+      ansible.builtin.add_host:
+        name: dunehost
+        groups: dune_vm
+        ansible_host: "{{ vm_ip }}"
+        ansible_user: dune
+        ansible_ssh_private_key_file: "{{ lookup('env', 'DUNE_SSH_PRIVATE_KEY_PATH') | default('~/.ssh/id_ed25519', true) }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+- name: Bootstrap Dune Kubernetes operators
+  hosts: dune_vm
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Copy Dune Kubernetes bootstrap script
+      ansible.builtin.template:
+        src: ../templates/dune-bootstrap-kubernetes.sh.j2
+        dest: /root/dune-bootstrap-kubernetes.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Run Dune Kubernetes bootstrap script
+      ansible.builtin.command:
+        cmd: /root/dune-bootstrap-kubernetes.sh
+      register: dune_k8s_bootstrap
+      changed_when: true
+
+    - name: Show bootstrap output
+      ansible.builtin.debug:
+        var: dune_k8s_bootstrap.stdout_lines
+
+    - name: Wait for Funcom operators
+      ansible.builtin.command: >
+        kubectl wait --for=condition=Available
+        -n funcom-operators
+        deployment/battlegroupoperator-controller-manager
+        deployment/databaseoperator-controller-manager
+        deployment/serveroperator-controller-manager
+        deployment/utilitiesoperator-controller-manager
+        --timeout=180s
+      changed_when: false

@@ -1,0 +1,546 @@
+---
+- name: Detect public IP
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Get public IP
+      ansible.builtin.uri:
+        url: https://api.ipify.org
+        return_content: true
+      register: detected_ip
+
+    - name: Store detected IP
+      ansible.builtin.set_fact:
+        player_ip: "{{ detected_ip.content }}"
+
+- name: Register Dune VM host
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: vm_ip
+      prompt: "Dune VM IP address"
+      private: false
+
+    - name: player_ip_override
+      prompt: "Player-facing IP override (leave blank to use detected public IP; use VM private IP for private/LAN-only)"
+      private: false
+      default: ""
+
+    - name: world_name
+      prompt: "World/server name"
+      private: false
+
+    - name: world_region_choice
+      prompt: "World region: 1 = Asia, 2 = Europe, 3 = North America, 4 = Oceania, 5 = South America"
+      private: false
+      default: "3"
+
+    - name: self_host_token
+      prompt: "Self-host service token"
+      private: false
+
+  tasks:
+    - name: Select final player-facing IP
+      ansible.builtin.set_fact:
+        final_player_ip: >-
+          {{
+            player_ip_override
+            if player_ip_override | length > 0
+            else hostvars['localhost']['player_ip']
+          }}
+
+    - name: Add Dune VM to temporary inventory
+      ansible.builtin.add_host:
+        name: dunehost
+        groups: dune_vm
+        ansible_host: "{{ vm_ip }}"
+        ansible_user: dune
+        ansible_ssh_private_key_file: "{{ lookup('env', 'DUNE_SSH_PRIVATE_KEY_PATH') | default('~/.ssh/id_ed25519', true) }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+        vm_ip: "{{ vm_ip }}"
+        world_name: "{{ world_name }}"
+        world_region_choice: "{{ world_region_choice }}"
+        self_host_token: "{{ self_host_token }}"
+        player_ip: "{{ final_player_ip }}"
+
+- name: Run vendor Dune setup
+  hosts: dune_vm
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Validate region choice
+      ansible.builtin.assert:
+        that:
+          - world_region_choice in ["1", "2", "3", "4", "5"]
+        fail_msg: "Region must be 1=Asia, 2=Europe, 3=North America, 4=Oceania, or 5=South America."
+
+    - name: Decode self-host token claims
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import base64
+        import json
+
+        token = {{ self_host_token | to_json }}
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        print(json.dumps({
+            "service_auth_key": claims["ServiceAuthKey"],
+        }))
+        PY
+      args:
+        executable: /bin/bash
+      register: self_host_claims_raw
+      changed_when: false
+      no_log: true
+
+    - name: Store self-host token claims
+      ansible.builtin.set_fact:
+        self_host_claims: "{{ self_host_claims_raw.stdout | from_json }}"
+      no_log: true
+
+    - name: Preload battlegroup images and seed 0-0-shipping compatibility tags
+      ansible.builtin.shell: |
+        set -euo pipefail
+        DOWNLOAD_PATH="/home/dune/.dune/download"
+        VERSION_FILE="$DOWNLOAD_PATH/images/battlegroup/version.txt"
+        IMAGE_REPO="registry.funcom.com/funcom/self-hosting"
+
+        if [ ! -f "$VERSION_FILE" ]; then
+          echo "Missing battlegroup version file: $VERSION_FILE" >&2
+          exit 1
+        fi
+
+        VERSION="$(tr -d '\r\n' < "$VERSION_FILE")"
+
+        load_if_missing() {
+          local image_name="$1"
+          local tar_name="$2"
+          local source_image="$IMAGE_REPO/$image_name:$VERSION"
+
+          if ! ctr -n k8s.io images ls -q | grep -Fx "$source_image" >/dev/null; then
+            ctr -n k8s.io images import "$DOWNLOAD_PATH/images/battlegroup/$tar_name" >/dev/null
+          fi
+        }
+
+        tag_compatibility_image() {
+          local image_name="$1"
+          local source_image="$IMAGE_REPO/$image_name:$VERSION"
+          local compatibility_image="$IMAGE_REPO/$image_name:0-0-shipping"
+
+          if ctr -n k8s.io images ls -q | grep -Fx "$compatibility_image" >/dev/null; then
+            ctr -n k8s.io images rm "$compatibility_image" >/dev/null 2>&1 || true
+          fi
+
+          ctr -n k8s.io images tag "$source_image" "$compatibility_image" >/dev/null
+        }
+
+        load_if_missing "seabass-server-rabbitmq" "server-rabbitmq.tar"
+        load_if_missing "seabass-server-text-router" "server-text-router.tar"
+        load_if_missing "seabass-server-bg-director" "server-bg-director.tar"
+        load_if_missing "seabass-server-gateway" "server-gateway.tar"
+        load_if_missing "seabass-server-db-utils" "server-db-utils.tar"
+        load_if_missing "seabass-server" "server.tar"
+
+        tag_compatibility_image "seabass-server-rabbitmq"
+        tag_compatibility_image "seabass-server-text-router"
+        tag_compatibility_image "seabass-server-bg-director"
+        tag_compatibility_image "seabass-server-gateway"
+        tag_compatibility_image "seabass-server-db-utils"
+        tag_compatibility_image "seabass-server"
+
+        echo "Prepared 0-0-shipping compatibility tags for $VERSION"
+      args:
+        executable: /bin/bash
+      register: battlegroup_compatibility_images
+      changed_when: true
+
+    - name: Show compatibility tag preparation result
+      ansible.builtin.debug:
+        var: battlegroup_compatibility_images.stdout_lines
+
+    - name: Run vendor world.sh non-interactively
+      become_user: dune
+      ansible.builtin.command:
+        cmd: bash ./setup/world.sh
+        chdir: /home/dune/.dune/download/scripts
+        stdin: |
+          {{ world_name }}
+          {{ world_region_choice }}
+          {{ self_host_token }}
+      environment:
+        HOME: /home/dune
+      register: vendor_world_result
+      no_log: true
+
+    - name: Get created Dune namespace
+      ansible.builtin.shell: |
+        kubectl get ns --no-headers -o custom-columns=NAME:.metadata.name | grep '^funcom-seabass-' | tail -n1
+      register: dune_namespace
+      changed_when: false
+
+    - name: Fail if no Dune namespace was created
+      ansible.builtin.fail:
+        msg: "No funcom-seabass namespace was created."
+      when: dune_namespace.stdout | length == 0
+
+    - name: Show created namespace
+      ansible.builtin.debug:
+        msg: "Created namespace: {{ dune_namespace.stdout }}"
+
+    - name: Store world-unique host datacenter ID
+      ansible.builtin.set_fact:
+        world_host_datacenter_id: "{{ dune_namespace.stdout | regex_replace('^funcom-seabass-', '') }}"
+
+    - name: Wait for Battlegroup resource
+      ansible.builtin.shell: |
+        BG="{{ dune_namespace.stdout | regex_replace('^funcom-seabass-', '') }}"
+        kubectl get battlegroup "$BG" -n "{{ dune_namespace.stdout }}"
+      register: bg_wait
+      retries: 30
+      delay: 5
+      until: bg_wait.rc == 0
+      changed_when: false
+
+    - name: Patch generated world manifest with player-facing IP and host datacenter ID
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NS="{{ dune_namespace.stdout }}"
+        BG="${NS#funcom-seabass-}"
+        MANIFEST="/home/dune/.dune/${BG}.yaml"
+
+        if [ ! -f "$MANIFEST" ]; then
+          echo "Generated world manifest not found at $MANIFEST; skipping."
+          exit 0
+        fi
+
+        python3 - "$MANIFEST" "{{ player_ip }}" "{{ world_host_datacenter_id }}" <<'PY'
+        import sys
+
+        path, player_ip, host_id = sys.argv[1], sys.argv[2], sys.argv[3]
+        lines = open(path, encoding="utf-8").read().splitlines(keepends=True)
+        next_field = None
+        replaced_ip = 0
+        replaced_host_id = 0
+
+        for index, line in enumerate(lines):
+            if "name: HOST_DATACENTER_IP_ADDRESS" in line:
+                next_field = "ip"
+                continue
+            if "name: HOST_DATACENTER_ID" in line:
+                next_field = "host_id"
+                continue
+            if next_field:
+                if "value:" in line:
+                    indent = line[: len(line) - len(line.lstrip())]
+                    newline = "\n" if line.endswith("\n") else ""
+                    if next_field == "ip":
+                        lines[index] = f"{indent}value: {player_ip}{newline}"
+                        replaced_ip += 1
+                    else:
+                        lines[index] = f"{indent}value: {host_id}{newline}"
+                        replaced_host_id += 1
+                next_field = None
+
+        if replaced_ip == 0:
+            raise SystemExit("No HOST_DATACENTER_IP_ADDRESS values were found in the generated world manifest")
+        if replaced_host_id == 0:
+            raise SystemExit("No HOST_DATACENTER_ID values were found in the generated world manifest")
+
+        open(path, "w", encoding="utf-8").writelines(lines)
+        print(f"Updated {replaced_ip} HOST_DATACENTER_IP_ADDRESS values and {replaced_host_id} HOST_DATACENTER_ID values in {path}")
+        PY
+      args:
+        executable: /bin/bash
+      register: manifest_ip_patch
+      changed_when: "'skipping.' not in manifest_ip_patch.stdout"
+
+    - name: Show manifest IP patch result
+      ansible.builtin.debug:
+        var: manifest_ip_patch.stdout_lines
+
+    - name: Patch battlegroup host connection values
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NS="{{ dune_namespace.stdout }}"
+        BG="${NS#funcom-seabass-}"
+        TMP_JSON="$(mktemp)"
+        trap 'rm -f "$TMP_JSON"' EXIT
+
+        kubectl get battlegroup "$BG" -n "$NS" -o json > "$TMP_JSON"
+
+        PATCH="$(python3 - "$TMP_JSON" "{{ player_ip }}" "{{ world_host_datacenter_id }}" <<'PY'
+        import json
+        import sys
+
+        path, player_ip, host_id = sys.argv[1], sys.argv[2], sys.argv[3]
+        bg = json.load(open(path, encoding="utf-8"))
+        ops = []
+
+        def esc(part):
+            return str(part).replace("~", "~0").replace("/", "~1")
+
+        def walk(node, path_parts):
+            if isinstance(node, dict):
+                envs = node.get("envVars")
+                if isinstance(envs, list):
+                    for index, item in enumerate(envs):
+                        if isinstance(item, dict) and item.get("name") == "HOST_DATACENTER_IP_ADDRESS":
+                            ops.append({
+                                "op": "replace" if "value" in item else "add",
+                                "path": "/" + "/".join(esc(part) for part in path_parts + ["envVars", index, "value"]),
+                                "value": player_ip,
+                            })
+                        if isinstance(item, dict) and item.get("name") == "HOST_DATACENTER_ID":
+                            ops.append({
+                                "op": "replace" if "value" in item else "add",
+                                "path": "/" + "/".join(esc(part) for part in path_parts + ["envVars", index, "value"]),
+                                "value": host_id,
+                            })
+                for key, value in node.items():
+                    walk(value, path_parts + [key])
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    walk(value, path_parts + [index])
+
+        walk(bg.get("spec", {}), ["spec"])
+        print(json.dumps(ops))
+        PY
+        )"
+
+        if [ "$PATCH" = "[]" ]; then
+          echo "No HOST_DATACENTER_IP_ADDRESS or HOST_DATACENTER_ID values found in battlegroup spec."
+          exit 0
+        fi
+
+        kubectl patch battlegroup "$BG" -n "$NS" --type=json -p "$PATCH"
+      args:
+        executable: /bin/bash
+      register: battlegroup_ip_patch
+      changed_when: "'No HOST_DATACENTER_IP_ADDRESS or HOST_DATACENTER_ID values found in battlegroup spec.' not in battlegroup_ip_patch.stdout"
+
+    - name: Show battlegroup IP patch result
+      ansible.builtin.debug:
+        var: battlegroup_ip_patch.stdout_lines
+
+    - name: Patch battlegroup display title
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NS="{{ dune_namespace.stdout }}"
+        BG="${NS#funcom-seabass-}"
+        PATCH='{{ {"spec": {"title": world_name}} | to_json }}'
+        kubectl patch battlegroup "$BG" -n "$NS" --type=merge -p "$PATCH"
+      args:
+        executable: /bin/bash
+      register: battlegroup_title_patch
+      changed_when: true
+
+    - name: Show battlegroup title patch result
+      ansible.builtin.debug:
+        var: battlegroup_title_patch.stdout_lines
+
+    - name: Remove custom scheduler references from battlegroup
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NS="{{ dune_namespace.stdout }}"
+        BG="${NS#funcom-seabass-}"
+        TMP_JSON="$(mktemp)"
+        trap 'rm -f "$TMP_JSON"' EXIT
+
+        kubectl get battlegroup "$BG" -n "$NS" -o json > "$TMP_JSON"
+
+        PATCH="$(python3 - "$TMP_JSON" <<'PY'
+        import json
+        import sys
+
+        path = sys.argv[1]
+        bg = json.load(open(path, encoding="utf-8"))
+        sets = bg.get("spec", {}).get("serverGroup", {}).get("template", {}).get("spec", {}).get("sets", [])
+        ops = [
+            {
+                "op": "remove",
+                "path": f"/spec/serverGroup/template/spec/sets/{index}/schedulerName",
+            }
+            for index, item in enumerate(sets)
+            if isinstance(item, dict) and "schedulerName" in item
+        ]
+        print(json.dumps(ops))
+        PY
+        )"
+
+        if [ "$PATCH" = "[]" ]; then
+          echo "No schedulerName entries found in battlegroup spec."
+          exit 0
+        fi
+
+        kubectl patch battlegroup "$BG" -n "$NS" --type=json -p "$PATCH"
+      args:
+        executable: /bin/bash
+      register: battlegroup_scheduler_patch
+      changed_when: "'No schedulerName entries found in battlegroup spec.' not in battlegroup_scheduler_patch.stdout"
+
+    - name: Show battlegroup scheduler patch result
+      ansible.builtin.debug:
+        var: battlegroup_scheduler_patch.stdout_lines
+
+    - name: Patch generated server-gateway secret manifest with service auth key
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NS="{{ dune_namespace.stdout }}"
+        BG="${NS#funcom-seabass-}"
+        SECRET_MANIFEST="/home/dune/.dune/${BG}-fls-secret.yaml"
+
+        if [ ! -f "$SECRET_MANIFEST" ]; then
+          echo "Generated server-gateway secret manifest not found at $SECRET_MANIFEST; skipping."
+          exit 0
+        fi
+
+        python3 - "$SECRET_MANIFEST" "{{ self_host_claims.service_auth_key }}" <<'PY'
+        import sys
+
+        path, service_auth_key = sys.argv[1], sys.argv[2]
+        lines = open(path, encoding="utf-8").read().splitlines(keepends=True)
+        replaced = 0
+
+        for index, line in enumerate(lines):
+            if line.strip().startswith('fls-apikey:'):
+                indent = line[: len(line) - len(line.lstrip())]
+                newline = "\n" if line.endswith("\n") else ""
+                lines[index] = f'{indent}fls-apikey: "{service_auth_key}"{newline}'
+                replaced += 1
+
+        if replaced == 0:
+            raise SystemExit("No fls-apikey values were found in the generated server-gateway secret manifest")
+
+        open(path, "w", encoding="utf-8").writelines(lines)
+        print(f"Updated {replaced} fls-apikey values in {path}")
+        PY
+      args:
+        executable: /bin/bash
+      register: secret_manifest_patch
+      changed_when: "'skipping.' not in secret_manifest_patch.stdout"
+      no_log: true
+
+    - name: Run battlegroup update-from-downloads
+      become_user: dune
+      ansible.builtin.command:
+        cmd: ./battlegroup.sh update-from-downloads
+        chdir: /home/dune/.dune/download/scripts
+      register: bg_update_result
+
+    - name: Show battlegroup update output
+      ansible.builtin.debug:
+        var: bg_update_result.stdout_lines
+
+    - name: Apply default user settings
+      become_user: dune
+      ansible.builtin.command:
+        cmd: ./battlegroup.sh apply-default-usersettings
+        chdir: /home/dune/.dune/download/scripts
+      register: bg_usersettings_result
+
+    - name: Show default user settings output
+      ansible.builtin.debug:
+        var: bg_usersettings_result.stdout_lines
+
+    - name: Patch live server-gateway secret with service auth key
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl patch secret server-gateway-secret -n "{{ dune_namespace.stdout }}" \
+          --type=merge \
+          -p '{{ {"stringData": {"fls-apikey": self_host_claims.service_auth_key}} | to_json }}'
+      args:
+        executable: /bin/bash
+      register: secret_patch_result
+      changed_when: true
+      no_log: true
+
+    - name: Install battlegroup helper shortcuts
+      block:
+        - name: Ensure Dune helper bin directory exists
+          ansible.builtin.file:
+            path: /home/dune/.dune/bin
+            state: directory
+            owner: dune
+            group: dune
+            mode: "0755"
+
+        - name: Ensure battlegroup helper symlink exists
+          ansible.builtin.file:
+            src: /home/dune/.dune/download/scripts/battlegroup.sh
+            dest: /home/dune/.dune/bin/battlegroup
+            state: link
+            owner: dune
+            group: dune
+            force: true
+
+        - name: Ensure bg-util helper symlink exists
+          ansible.builtin.file:
+            src: /home/dune/.dune/download/scripts/bg-util
+            dest: /home/dune/.dune/bin/bg-util
+            state: link
+            owner: dune
+            group: dune
+            force: true
+
+    - name: Start battlegroup after setup
+      become_user: dune
+      ansible.builtin.command:
+        cmd: /home/dune/.dune/bin/battlegroup start
+      register: bg_start_result
+      changed_when: "'is starting' in bg_start_result.stdout"
+
+    - name: Show battlegroup start output
+      ansible.builtin.debug:
+        var: bg_start_result.stdout_lines
+
+    - name: Wait for battlegroup control plane to become healthy
+      ansible.builtin.shell: |
+        NS="{{ dune_namespace.stdout }}"
+        BG="${NS#funcom-seabass-}"
+        kubectl get battlegroup "$BG" -n "$NS" -o jsonpath='{.status.phase}{"|"}{.status.database.phase}{"|"}{.status.utilities.serverGateway.phase}{"|"}{.status.utilities.director.phase}'
+      args:
+        executable: /bin/bash
+      register: bg_phase_state
+      retries: 30
+      delay: 10
+      until: bg_phase_state.stdout == "Healthy|Ready|Healthy|Healthy"
+      changed_when: false
+
+    - name: Wait for core game servers to become ready
+      ansible.builtin.shell: |
+        NS="{{ dune_namespace.stdout }}"
+        kubectl get serverstats -n "$NS" --no-headers | awk '$3 == "Running" && $4 == "true" {count++} END {print count+0}'
+      args:
+        executable: /bin/bash
+      register: bg_ready_servers
+      retries: 30
+      delay: 10
+      until: bg_ready_servers.stdout | int >= 2
+      changed_when: false
+
+    - name: Run battlegroup status
+      become_user: dune
+      ansible.builtin.command:
+        cmd: /home/dune/.dune/bin/battlegroup status
+      register: bg_status_result
+      changed_when: false
+
+    - name: Show battlegroup status output
+      ansible.builtin.debug:
+        var: bg_status_result.stdout_lines
+
+    - name: Show follow-up commands
+      ansible.builtin.debug:
+        msg:
+          - "Vendor setup completed."
+          - "SSH into VM:"
+          - "ssh dune@{{ vm_ip }}"
+          - "Check:"
+          - "kubectl get pods -A"
+          - "/home/dune/.dune/download/scripts/battlegroup.sh status"

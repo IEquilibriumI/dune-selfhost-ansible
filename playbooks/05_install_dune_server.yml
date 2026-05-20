@@ -1,0 +1,169 @@
+---
+- name: Register Dune VM host
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: vm_ip
+      prompt: "Dune VM IP address"
+      private: false
+
+    - name: dune_package_source
+      prompt: "Linux package source URL or local archive path (recommended for live self-host; leave blank only if using a Steam-accessible app ID)"
+      private: false
+      default: ""
+
+    - name: steam_app_id
+      prompt: "Dune self-host server Steam app ID"
+      private: false
+      default: "4754530"
+
+  tasks:
+    - name: Add Dune VM to temporary inventory
+      ansible.builtin.add_host:
+        name: dunehost
+        groups: dune_vm
+        ansible_host: "{{ vm_ip }}"
+        ansible_user: dune
+        ansible_ssh_private_key_file: "{{ lookup('env', 'DUNE_SSH_PRIVATE_KEY_PATH') | default('~/.ssh/id_ed25519', true) }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+        dune_package_source: "{{ dune_package_source }}"
+        steam_app_id: "{{ steam_app_id }}"
+
+- name: Install Dune server files
+  hosts: dune_vm
+  become: true
+
+  tasks:
+    - name: Determine package source type
+      ansible.builtin.set_fact:
+        dune_package_is_url: "{{ dune_package_source is match('^https?://') }}"
+      when: dune_package_source | length > 0
+
+    - name: Create Dune self-host directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: dune
+        group: dune
+        mode: "0755"
+      loop:
+        - /home/dune/.dune/download
+        - /home/dune/server
+
+    - name: Build direct package archive path
+      ansible.builtin.set_fact:
+        dune_package_archive_path: >-
+          /tmp/{{
+            (
+              dune_package_source
+              | regex_replace('^.+/([^/?]+)(\\?.*)?$', '\\1')
+            ) if dune_package_is_url else
+            (dune_package_source | basename)
+          }}
+      when: dune_package_source | length > 0
+
+    - name: Download direct Linux package archive
+      ansible.builtin.get_url:
+        url: "{{ dune_package_source }}"
+        dest: "{{ dune_package_archive_path }}"
+        mode: "0644"
+      when:
+        - dune_package_source | length > 0
+        - dune_package_is_url
+
+    - name: Copy local Linux package archive
+      ansible.builtin.copy:
+        src: "{{ dune_package_source | expanduser }}"
+        dest: "{{ dune_package_archive_path }}"
+        mode: "0644"
+      when:
+        - dune_package_source | length > 0
+        - not dune_package_is_url
+
+    - name: Extract direct Linux package archive
+      become_user: dune
+      ansible.builtin.unarchive:
+        src: "{{ dune_package_archive_path }}"
+        dest: /home/dune/.dune/download
+        remote_src: true
+      register: dune_archive_install
+      when: dune_package_source | length > 0
+
+    - name: Normalize nested download directory after archive extraction
+      become_user: dune
+      ansible.builtin.shell: |
+        set -euo pipefail
+        shopt -s dotglob nullglob
+        if [ -d /home/dune/.dune/download/download/scripts ] && [ ! -e /home/dune/.dune/download/scripts ]; then
+          mv /home/dune/.dune/download/download/* /home/dune/.dune/download/
+          rmdir /home/dune/.dune/download/download
+        fi
+      args:
+        executable: /bin/bash
+      when: dune_package_source | length > 0
+
+    - name: Download Dune server package with SteamCMD
+      become_user: dune
+      ansible.builtin.shell: |
+        set -euo pipefail
+        attempt=1
+        while [ "$attempt" -le 3 ]; do
+          set +e
+          output="$(
+            env HOME=/home/dune /home/dune/Steam/steamcmd.sh \
+              +@ShutdownOnFailedCommand 1 \
+              +@NoPromptForPassword 1 \
+              +force_install_dir /home/dune/.dune/download \
+              +login anonymous \
+              +app_update {{ steam_app_id }} validate \
+              +logoff \
+              +quit 2>&1
+          )"
+          rc=$?
+          set -e
+          printf '%s\n' "$output"
+
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+
+          if printf '%s' "$output" | grep -q "Missing configuration" && [ "$attempt" -lt 3 ]; then
+            attempt=$((attempt + 1))
+            sleep 10
+            continue
+          fi
+
+          exit "$rc"
+        done
+      args:
+        executable: /bin/bash
+      register: dune_server_install
+      changed_when: "'Success!' in dune_server_install.stdout or 'fully installed' in dune_server_install.stdout"
+      when: dune_package_source | length == 0
+
+    - name: Show direct package install result
+      ansible.builtin.debug:
+        msg: "Installed Dune server files from direct archive: {{ dune_package_archive_path }}"
+      when: dune_package_source | length > 0
+
+    - name: Show SteamCMD Dune install output
+      ansible.builtin.debug:
+        var: dune_server_install.stdout_lines
+      when: dune_package_source | length == 0
+
+    - name: Check expected Dune vendor scripts exist
+      ansible.builtin.stat:
+        path: /home/dune/.dune/download/scripts/setup.sh
+      register: setup_script
+
+    - name: Check expected battlegroup script exists
+      ansible.builtin.stat:
+        path: /home/dune/.dune/download/scripts/battlegroup.sh
+      register: battlegroup_script
+
+    - name: Fail if Dune server files did not install correctly
+      ansible.builtin.fail:
+        msg: "Dune server install appears incomplete. Vendor scripts were not found."
+      when: not setup_script.stat.exists or not battlegroup_script.stat.exists

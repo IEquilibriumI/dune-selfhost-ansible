@@ -1,0 +1,63 @@
+---
+- name: Register Dune VM host
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: vm_ip
+      prompt: "Dune VM IP address"
+      private: false
+
+  tasks:
+    - name: Add Dune VM to temporary inventory
+      ansible.builtin.add_host:
+        name: dunehost
+        groups: dune_vm
+        ansible_host: "{{ vm_ip }}"
+        ansible_user: dune
+        ansible_ssh_private_key_file: "{{ lookup('env', 'DUNE_SSH_PRIVATE_KEY_PATH') | default('~/.ssh/id_ed25519', true) }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+- name: Install k3s
+  hosts: dune_vm
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Download k3s installer
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /tmp/install-k3s.sh
+        mode: "0755"
+
+    - name: Install k3s without Traefik
+      ansible.builtin.command:
+        cmd: sh /tmp/install-k3s.sh
+      environment:
+        INSTALL_K3S_EXEC: "server --disable=traefik --write-kubeconfig-mode=644"
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Enable and start k3s
+      ansible.builtin.systemd:
+        name: k3s
+        enabled: true
+        state: started
+
+    - name: Wait for Kubernetes node to exist
+      ansible.builtin.command: kubectl get nodes
+      register: k3s_nodes
+      retries: 30
+      delay: 6
+      until: k3s_nodes.rc == 0
+      changed_when: false
+
+    - name: Wait for Kubernetes node to be Ready
+      ansible.builtin.command: kubectl wait --for=condition=Ready node --all --timeout=180s
+      changed_when: false
+
+    - name: Remove k3s installer
+      ansible.builtin.file:
+        path: /tmp/install-k3s.sh
+        state: absent

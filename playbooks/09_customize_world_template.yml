@@ -1,0 +1,65 @@
+---
+- name: Register Dune VM host
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: vm_ip
+      prompt: "Dune VM IP address"
+      private: false
+
+  tasks:
+    - name: Add Dune VM to temporary inventory
+      ansible.builtin.add_host:
+        name: dunehost
+        groups: dune_vm
+        ansible_host: "{{ vm_ip }}"
+        ansible_user: dune
+        ansible_ssh_private_key_file: "{{ lookup('env', 'DUNE_SSH_PRIVATE_KEY_PATH') | default('~/.ssh/id_ed25519', true) }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+- name: Inspect and safely customize Dune world template
+  hosts: dune_vm
+  become: true
+  gather_facts: false
+
+  vars:
+    world_template_path: /home/dune/.dune/download/scripts/setup/templates/world-template.yaml
+
+  tasks:
+    - name: Backup original world template
+      ansible.builtin.copy:
+        src: "{{ world_template_path }}"
+        dest: "{{ world_template_path }}.ansible-backup"
+        remote_src: true
+        owner: dune
+        group: dune
+        mode: "0644"
+        force: false
+
+    - name: Remove memory-focused scheduler references for Ubuntu/k3s
+      ansible.builtin.lineinfile:
+        path: "{{ world_template_path }}"
+        regexp: '^\s*schedulerName:\s*memory-focused-scheduler\s*$'
+        state: absent
+
+    - name: Find Deep Desert sections
+      ansible.builtin.shell: |
+        grep -n -A35 -B15 "DeepDesert" "{{ world_template_path }}" || true
+      register: deep_desert_check
+      changed_when: false
+
+    - name: Show Deep Desert sections
+      ansible.builtin.debug:
+        var: deep_desert_check.stdout_lines
+
+    - name: Show remaining schedulerName lines
+      ansible.builtin.shell: |
+        grep -n "schedulerName" "{{ world_template_path }}" || true
+      register: scheduler_check
+      changed_when: false
+
+    - name: Print remaining schedulerName lines
+      ansible.builtin.debug:
+        var: scheduler_check.stdout_lines

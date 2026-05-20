@@ -1,0 +1,89 @@
+---
+- name: Build Ubuntu 24.04 cloud-init template on Proxmox
+  hosts: proxmox
+  gather_facts: false
+
+  vars_prompt:
+    - name: template_vmid
+      prompt: "Template VMID"
+      private: false
+      default: "200"
+
+    - name: template_name
+      prompt: "Template name"
+      private: false
+      default: "ubuntu-2404-cloudinit"
+
+    - name: proxmox_storage
+      prompt: "Proxmox storage for template disk"
+      private: false
+      default: "local-lvm"
+
+    - name: proxmox_bridge
+      prompt: "Proxmox bridge"
+      private: false
+      default: "vmbr0"
+
+  vars:
+    ubuntu_cloud_image_url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    ubuntu_cloud_image_path: "/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img"
+
+  tasks:
+    - name: Check if template VM already exists
+      ansible.builtin.command: "qm status {{ template_vmid }}"
+      register: template_status
+      failed_when: false
+      changed_when: false
+
+    - name: Stop if template already exists
+      ansible.builtin.fail:
+        msg: "Template VMID {{ template_vmid }} already exists. Delete it first or choose another VMID."
+      when: template_status.rc == 0
+
+    - name: Download Ubuntu 24.04 cloud image
+      ansible.builtin.get_url:
+        url: "{{ ubuntu_cloud_image_url }}"
+        dest: "{{ ubuntu_cloud_image_path }}"
+        mode: "0644"
+
+    - name: Create cloud-init VM shell
+      ansible.builtin.command: >
+        qm create {{ template_vmid }}
+        --name {{ template_name }}
+        --memory 2048
+        --cores 2
+        --net0 virtio,bridge={{ proxmox_bridge }}
+        --scsihw virtio-scsi-pci
+        --ostype l26
+        --agent enabled=1
+
+    - name: Import Ubuntu cloud image disk
+      ansible.builtin.command: >
+        qm importdisk {{ template_vmid }}
+        {{ ubuntu_cloud_image_path }}
+        {{ proxmox_storage }}
+
+    - name: Attach imported disk
+      ansible.builtin.command: >
+        qm set {{ template_vmid }}
+        --scsi0 {{ proxmox_storage }}:vm-{{ template_vmid }}-disk-0
+
+    - name: Add cloud-init drive
+      ansible.builtin.command: >
+        qm set {{ template_vmid }}
+        --ide2 {{ proxmox_storage }}:cloudinit
+
+    - name: Set boot disk
+      ansible.builtin.command: >
+        qm set {{ template_vmid }}
+        --boot c
+        --bootdisk scsi0
+
+    - name: Enable serial console
+      ansible.builtin.command: >
+        qm set {{ template_vmid }}
+        --serial0 socket
+        --vga serial0
+
+    - name: Convert VM to template
+      ansible.builtin.command: "qm template {{ template_vmid }}"

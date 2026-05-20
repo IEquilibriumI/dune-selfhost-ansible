@@ -1,0 +1,84 @@
+---
+- name: Detect public IP
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Get public IP
+      ansible.builtin.uri:
+        url: https://api.ipify.org
+        return_content: true
+      register: detected_ip
+
+    - name: Store detected IP
+      ansible.builtin.set_fact:
+        player_ip: "{{ detected_ip.content }}"
+
+- name: Register Dune VM host
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: vm_ip
+      prompt: "Dune VM IP address"
+      private: false
+
+    - name: player_ip_override
+      prompt: "Player-facing/public IP (leave blank to use detected IP)"
+      private: false
+      default: ""
+
+  tasks:
+    - name: Select final player-facing IP
+      ansible.builtin.set_fact:
+        player_ip: >-
+          {{
+            player_ip_override
+            if player_ip_override | length > 0
+            else hostvars['localhost']['player_ip']
+          }}
+
+    - name: Add Dune VM to temporary inventory
+      ansible.builtin.add_host:
+        name: dunehost
+        groups: dune_vm
+        ansible_host: "{{ vm_ip }}"
+        ansible_user: dune
+        ansible_ssh_private_key_file: "{{ lookup('env', 'DUNE_SSH_PRIVATE_KEY_PATH') | default('~/.ssh/id_ed25519', true) }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+        vm_ip: "{{ vm_ip }}"
+        player_ip: "{{ player_ip }}"
+
+- name: Prepare vendor setup
+  hosts: dune_vm
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Write settings.conf
+      ansible.builtin.copy:
+        dest: /home/dune/.dune/settings.conf
+        content: "\n\n\n{{ player_ip }}\n"
+        owner: dune
+        group: dune
+        mode: "0644"
+
+    - name: Ensure vendor scripts executable
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0755"
+      loop:
+        - /home/dune/.dune/download/scripts/setup.sh
+        - /home/dune/.dune/download/scripts/battlegroup.sh
+
+    - name: Show next command
+      ansible.builtin.debug:
+        msg:
+          - "Preparation complete."
+          - "SSH into VM:"
+          - "ssh dune@{{ vm_ip }}"
+          - "Run:"
+          - "cd /home/dune/.dune/download"
+          - "./scripts/setup.sh"

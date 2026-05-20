@@ -1,0 +1,170 @@
+---
+- name: Create Dune Ubuntu VM from cloud-init template
+  hosts: proxmox
+  gather_facts: false
+
+  vars_prompt:
+    - name: template_vmid
+      prompt: "Ubuntu cloud-init template VMID"
+      private: false
+      default: "200"
+
+    - name: dune_vmid
+      prompt: "New Dune VMID"
+      private: false
+      default: "201"
+
+    - name: dune_vm_name
+      prompt: "New Dune VM name"
+      private: false
+      default: "Dune-Server"
+
+    - name: proxmox_storage
+      prompt: "Proxmox VM disk storage"
+      private: false
+      default: "local-lvm"
+
+    - name: proxmox_bridge
+      prompt: "Proxmox bridge"
+      private: false
+      default: "vmbr0"
+
+    - name: cpu_cores
+      prompt: "CPU cores"
+      private: false
+      default: "6"
+
+    - name: ram_gb
+      prompt: "RAM in GB"
+      private: false
+      default: "40"
+
+    - name: disk_gb
+      prompt: "Disk size in GB"
+      private: false
+      default: "110"
+
+    - name: vm_ip_cidr
+      prompt: "VM internal IP/CIDR, example 192.168.1.200/24"
+      private: false
+      default: "192.168.1.200/24"
+
+    - name: vm_gateway
+      prompt: "VM gateway IP"
+      private: false
+      default: "192.168.1.1"
+
+    - name: ssh_public_key_path
+      prompt: "SSH public key path on Ansible machine"
+      private: false
+      default: "{{ lookup('env', 'DUNE_SSH_PUBLIC_KEY_PATH') | default('~/.ssh/id_ed25519.pub', true) }}"
+
+  vars:
+    dune_user: "dune"
+    dune_user_password: "dune"
+    vm_dns: "1.1.1.1 1.0.0.1"
+    minimum_cpu_cores: 4
+    minimum_disk_gb: 100
+    minimum_ram_gb: 20
+
+  tasks:
+    - name: Validate CPU minimum
+      ansible.builtin.assert:
+        that:
+          - cpu_cores | int >= minimum_cpu_cores
+        fail_msg: "CPU cores must be at least {{ minimum_cpu_cores }}."
+
+    - name: Validate disk minimum
+      ansible.builtin.assert:
+        that:
+          - disk_gb | int >= minimum_disk_gb
+        fail_msg: "Disk size must be at least {{ minimum_disk_gb }}GB."
+
+    - name: Validate RAM minimum
+      ansible.builtin.assert:
+        that:
+          - ram_gb | int >= minimum_ram_gb
+        fail_msg: "RAM must be at least {{ minimum_ram_gb }}GB."
+
+    - name: Check if Dune VM already exists
+      ansible.builtin.command: "qm status {{ dune_vmid }}"
+      register: dune_vm_status
+      failed_when: false
+      changed_when: false
+
+    - name: Stop if Dune VM already exists
+      ansible.builtin.fail:
+        msg: "VMID {{ dune_vmid }} already exists. Delete it first or choose another VMID."
+      when: dune_vm_status.rc == 0
+
+    - name: Read SSH public key
+      ansible.builtin.set_fact:
+        ssh_public_key: "{{ lookup('file', ssh_public_key_path | expanduser) }}"
+
+    - name: Clone Ubuntu template
+      ansible.builtin.command: >
+        qm clone {{ template_vmid }} {{ dune_vmid }}
+        --name {{ dune_vm_name }}
+        --full 1
+        --storage {{ proxmox_storage }}
+
+    - name: Configure VM hardware
+      ansible.builtin.command: >
+        qm set {{ dune_vmid }}
+        --memory {{ (ram_gb | int) * 1024 }}
+        --balloon 0
+        --allow-ksm 0
+        --cores {{ cpu_cores }}
+        --sockets 1
+        --cpu host,flags=+nested-virt;+aes
+        --numa 1
+        --bios ovmf
+        --serial0 socket
+        --vga serial0
+        --machine q35
+        --scsihw virtio-scsi-single
+        --net0 virtio,bridge={{ proxmox_bridge }}
+
+    - name: Add EFI disk
+      ansible.builtin.command: >
+        qm set {{ dune_vmid }}
+        --efidisk0 {{ proxmox_storage }}:0,efitype=4m,pre-enrolled-keys=0
+
+    - name: Resize primary disk
+      ansible.builtin.command: >
+        qm resize {{ dune_vmid }} scsi0 {{ disk_gb }}G
+
+    - name: Configure disk flags
+      ansible.builtin.command: >
+        qm set {{ dune_vmid }}
+        --scsi0 {{ proxmox_storage }}:vm-{{ dune_vmid }}-disk-0,iothread=1,ssd=1
+
+    - name: Write temporary SSH key file on Proxmox
+      ansible.builtin.copy:
+        content: "{{ ssh_public_key }}"
+        dest: "/tmp/dune-vm-{{ dune_vmid }}.pub"
+        mode: "0600"
+
+    - name: Configure cloud-init user
+      ansible.builtin.command: >
+        qm set {{ dune_vmid }}
+        --ciuser {{ dune_user }}
+        --sshkeys /tmp/dune-vm-{{ dune_vmid }}.pub
+
+    - name: Apply cloud-init networking
+      ansible.builtin.command: >
+        qm set {{ dune_vmid }}
+        --ipconfig0 ip={{ vm_ip_cidr }},gw={{ vm_gateway }}
+        --nameserver "{{ vm_dns }}"
+
+    - name: Enable QEMU guest agent
+      ansible.builtin.command: >
+        qm set {{ dune_vmid }}
+        --agent enabled=1
+
+    - name: Regenerate cloud-init image
+      ansible.builtin.command: >
+        qm cloudinit update {{ dune_vmid }}
+
+    - name: Start Dune VM
+      ansible.builtin.command: "qm start {{ dune_vmid }}"

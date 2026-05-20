@@ -1,0 +1,74 @@
+---
+- name: Register Dune VM host
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: vm_ip
+      prompt: "Dune VM IP address"
+      private: false
+
+  tasks:
+    - name: Add Dune VM to temporary inventory
+      ansible.builtin.add_host:
+        name: dunehost
+        groups: dune_vm
+        ansible_host: "{{ vm_ip }}"
+        ansible_user: dune
+        ansible_ssh_private_key_file: "{{ lookup('env', 'DUNE_SSH_PRIVATE_KEY_PATH') | default('~/.ssh/id_ed25519', true) }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+- name: Install SteamCMD
+  hosts: dune_vm
+  become: true
+
+  tasks:
+
+    - name: Create SteamCMD temp directory
+      ansible.builtin.file:
+        path: /tmp/steamcmd
+        state: directory
+        mode: "0755"
+
+    - name: Download SteamCMD
+      ansible.builtin.get_url:
+        url: https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz
+        dest: /tmp/steamcmd/steamcmd_linux.tar.gz
+        mode: "0644"
+
+    - name: Extract SteamCMD
+      become_user: dune
+      ansible.builtin.unarchive:
+        src: /tmp/steamcmd/steamcmd_linux.tar.gz
+        dest: /home/dune/Steam
+        remote_src: true
+
+    - name: Create Steam compatibility symlink root
+      ansible.builtin.file:
+        src: /home/dune/Steam
+        dest: /home/dune/.steam/root
+        state: link
+        force: true
+        owner: dune
+        group: dune
+
+    - name: Create Steam compatibility symlink steam
+      ansible.builtin.file:
+        src: /home/dune/Steam
+        dest: /home/dune/.steam/steam
+        state: link
+        force: true
+        owner: dune
+        group: dune
+
+    - name: Run SteamCMD first launch
+      become_user: dune
+      ansible.builtin.command:
+        cmd: /home/dune/Steam/steamcmd.sh +quit
+      register: steamcmd_init
+      changed_when: false
+
+    - name: Show SteamCMD output
+      ansible.builtin.debug:
+        var: steamcmd_init.stdout_lines

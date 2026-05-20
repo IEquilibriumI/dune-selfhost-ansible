@@ -1,0 +1,5 @@
+inventory/inventory-priv.ini
+.ansible/
+.venv/
+*.retry
+*~
