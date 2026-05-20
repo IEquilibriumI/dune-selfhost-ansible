@@ -117,6 +117,7 @@ Recommended:
 
 - Use a dedicated SSH keypair for this Dune VM instead of your normal personal key
 - Use the same keypair for both cloud-init injection and later SSH access to the guest
+- Guest SSH password authentication is not part of this workflow; the Ubuntu VM is expected to be accessed with the injected keypair
 
 Default paths used by the wrapper:
 
@@ -278,6 +279,10 @@ ANSIBLE_PLAYBOOK=/path/to/ansible-playbook ./scripts/run_full_setup.sh
 
 The playbooks already use relaxed host-key handling for the rebuilt guest. If you are manually SSHing and see host key mismatch warnings, remove the old entry from your local `known_hosts`.
 
+### The wrapper asks for SSH key paths, but you normally use passwords
+
+That is intentional. This repo provisions a fresh Ubuntu guest and injects an SSH public key through cloud-init. Later playbooks connect to that guest with the matching private key. Password-based SSH to the Dune VM is not implemented in the public workflow.
+
 ### SteamCMD returns `Missing configuration`
 
 The install playbook already retries the live app download automatically. This is expected behavior on some first attempts.
@@ -285,6 +290,10 @@ The install playbook already retries the live app download automatically. This i
 ### Battlegroup creation stalls on a fresh world
 
 This repo preloads the live battlegroup images and seeds local `0-0-shipping` compatibility tags before `world.sh` runs. That avoids the vendor first-start schema race seen on clean hosts.
+
+### `battlegroup.sh status` says `Reconciling` but the maps are already `Running true`
+
+This can happen after a manual vendor `battlegroup.sh update`. In the validated setup, the game server pods, gateway, and director can all be healthy while the operator still reports a stale top-level `Reconciling` phase. Treat the individual map states and pod health as the stronger signal.
 
 ### Public IP detection is wrong
 
@@ -320,6 +329,7 @@ Optional helpers:
 ## Notes
 
 - No real inventory, tokens, hostnames, or public IPs are stored in this repo.
+- Do not share raw `kubectl get battlegroup -o yaml` output publicly; it can include live self-host tokens and generated database credentials.
 - The target Dune VM intentionally uses `/home/dune/...` paths because that matches the vendor script layout.
 
 ## License

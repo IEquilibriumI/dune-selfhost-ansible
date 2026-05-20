@@ -62,6 +62,21 @@
         owner: dune
         group: dune
 
+    - name: Remove existing SteamCMD compatibility command
+      ansible.builtin.file:
+        path: /usr/local/bin/steamcmd
+        state: absent
+
+    - name: Create SteamCMD command compatibility wrapper
+      ansible.builtin.copy:
+        dest: /usr/local/bin/steamcmd
+        mode: "0755"
+        owner: root
+        group: root
+        content: |
+          #!/usr/bin/env bash
+          exec /home/dune/Steam/steamcmd.sh "$@"
+
     - name: Run SteamCMD first launch
       become_user: dune
       ansible.builtin.command:
