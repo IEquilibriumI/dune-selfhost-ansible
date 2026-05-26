@@ -43,6 +43,41 @@
     - name: Gather facts after SSH becomes available
       ansible.builtin.setup:
 
+    - name: Remove injected DNS search domains from cloud-init netplan
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        from pathlib import Path
+
+        changed = False
+        for path in Path("/etc/netplan").glob("*.yaml"):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            updated = []
+            index = 0
+            while index < len(lines):
+                line = lines[index]
+                if line.strip() == "search:":
+                    changed = True
+                    index += 1
+                    while index < len(lines) and lines[index].startswith("        - "):
+                        index += 1
+                    continue
+                updated.append(line)
+                index += 1
+
+            if updated != lines:
+                path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+
+        print("changed" if changed else "unchanged")
+        PY
+      args:
+        executable: /bin/bash
+      register: netplan_search_cleanup
+      changed_when: netplan_search_cleanup.stdout.strip() == "changed"
+
+    - name: Apply netplan after DNS search cleanup
+      ansible.builtin.command: netplan apply
+      when: netplan_search_cleanup.changed
+
     - name: Install Dune prerequisites
       ansible.builtin.apt:
         name:
