@@ -124,6 +124,7 @@
         --machine q35
         --scsihw virtio-scsi-single
         --net0 virtio,bridge={{ proxmox_bridge }}
+        --ciupgrade 1
 
     - name: Add EFI disk
       ansible.builtin.command: >

@@ -30,14 +30,18 @@
       ansible.builtin.wait_for_connection:
         timeout: 300
 
+    - name: Wait for cloud-init
+      ansible.builtin.command: cloud-init status
+      register: result
+      until: "'done' in result.stdout"
+      retries: 20
+      delay: 5
+      no_log: true
+      failed_when: result.rc != 2
+      changed_when: false
+
     - name: Gather facts after SSH becomes available
       ansible.builtin.setup:
-
-    - name: Disable interactive apt prompts
-      ansible.builtin.lineinfile:
-        path: /etc/environment
-        line: DEBIAN_FRONTEND=noninteractive
-        create: true
 
     - name: Remove injected DNS search domains from cloud-init netplan
       ansible.builtin.shell: |
@@ -74,12 +78,6 @@
       ansible.builtin.command: netplan apply
       when: netplan_search_cleanup.changed
 
-    - name: Update apt cache
-      ansible.builtin.apt:
-        update_cache: yes
-      environment:
-        DEBIAN_FRONTEND: noninteractive
-
     - name: Install Dune prerequisites
       ansible.builtin.apt:
         name:
@@ -103,8 +101,10 @@
           - jq
           - htop
         state: present
+      no_log: true
       environment:
         DEBIAN_FRONTEND: noninteractive
+      become: true
 
     - name: Enable qemu guest agent
       ansible.builtin.systemd:
